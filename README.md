@@ -63,6 +63,8 @@ The D-Bus contract currently uses:
   application.
 - Certificate inputs have strict size limits and are parsed by the backend
   with OpenSSL.
+- Before creating a profile, the backend removes orphaned application-managed
+  material and permits at most 32 system FortiSSLVPN profiles.
 - The backend checks certificate validity and verifies that a client
   certificate matches its private key.
 - Imported private keys are normalized to unencrypted PKCS#8 and stored as

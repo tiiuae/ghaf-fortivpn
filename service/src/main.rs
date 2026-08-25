@@ -8,13 +8,14 @@ use openssl::pkcs12::Pkcs12;
 use openssl::pkey::{PKey, Private};
 use openssl::x509::X509;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::net::{IpAddr, Ipv6Addr};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use tempfile::Builder as TempBuilder;
+use tokio::sync::Mutex;
 use uuid::Uuid;
 use zbus::fdo;
 use zbus::interface;
@@ -26,12 +27,15 @@ const OBJECT_PATH: &str = "/org/ghaf/FortiVpn";
 const NM_BUS_NAME: &str = "org.freedesktop.NetworkManager";
 const NM_SETTINGS_PATH: &str = "/org/freedesktop/NetworkManager/Settings";
 const NM_SETTINGS_INTERFACE: &str = "org.freedesktop.NetworkManager.Settings";
+const NM_CONNECTION_INTERFACE: &str = "org.freedesktop.NetworkManager.Settings.Connection";
 const FORTISSLVPN_SERVICE_TYPE: &str = "org.freedesktop.NetworkManager.fortisslvpn";
 const DEFAULT_STATE_ROOT: &str = "/var/lib/ghaf/fortivpn";
 const MAX_BUNDLE_SIZE: usize = 10 * 1024 * 1024;
 const MAX_CERTIFICATE_SIZE: usize = 2 * 1024 * 1024;
 const MAX_PRIVATE_KEY_SIZE: usize = 2 * 1024 * 1024;
 const MAX_PASSWORD_SIZE: usize = 4096;
+const MAX_PROFILE_COUNT: usize = 32;
+const PROFILE_LIMIT_ERROR: &str = "The maximum number of VPN profiles has been reached";
 
 type Setting = HashMap<String, OwnedValue>;
 type Settings = HashMap<String, Setting>;
@@ -70,8 +74,14 @@ struct ProfileParameters<'a> {
     trusted_certificate: &'a str,
 }
 
+struct NetworkManagerProfiles {
+    uuids: HashSet<String>,
+    fortivpn_count: usize,
+}
+
 struct FortiVpnService {
     state_root: PathBuf,
+    profile_creation: Mutex<()>,
 }
 
 #[interface(name = "org.ghaf.FortiVpn1")]
@@ -93,6 +103,7 @@ impl FortiVpnService {
         private_key_password: String,
         ca_certificate: Vec<u8>,
     ) -> fdo::Result<String> {
+        let _profile_creation = self.profile_creation.lock().await;
         let password = Zeroizing::new(password);
         let pkcs12 = Zeroizing::new(pkcs12);
         let pkcs12_password = Zeroizing::new(pkcs12_password);
@@ -359,21 +370,106 @@ fn write_file(path: &Path, contents: &[u8], mode: u32) -> ProfileResult<()> {
     Ok(())
 }
 
+fn reconcile_profile_storage(
+    state_root: &Path,
+    network_manager_uuids: &HashSet<String>,
+) -> ProfileResult<()> {
+    if !state_root.exists() {
+        return Ok(());
+    }
+    ensure_private_directory(state_root)?;
+
+    for entry in fs::read_dir(state_root)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if !file_type.is_dir() {
+            continue;
+        }
+
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let is_temporary = name.starts_with(".profile-");
+        let is_orphaned_profile =
+            Uuid::parse_str(&name).is_ok() && !network_manager_uuids.contains(name.as_str());
+        if is_temporary || is_orphaned_profile {
+            fs::remove_dir_all(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+async fn network_manager_profiles(
+    connection: &zbus::Connection,
+) -> ProfileResult<NetworkManagerProfiles> {
+    let settings_proxy = zbus::Proxy::new(
+        connection,
+        NM_BUS_NAME,
+        NM_SETTINGS_PATH,
+        NM_SETTINGS_INTERFACE,
+    )
+    .await
+    .map_err(|_| ProfileError("NetworkManager is unavailable"))?;
+    let profile_paths: Vec<OwnedObjectPath> = settings_proxy
+        .call("ListConnections", &())
+        .await
+        .map_err(|_| ProfileError("NetworkManager is unavailable"))?;
+
+    let mut profiles = NetworkManagerProfiles {
+        uuids: HashSet::new(),
+        fortivpn_count: 0,
+    };
+    for profile_path in profile_paths {
+        let profile_proxy = zbus::Proxy::new(
+            connection,
+            NM_BUS_NAME,
+            profile_path,
+            NM_CONNECTION_INTERFACE,
+        )
+        .await
+        .map_err(|_| ProfileError("NetworkManager is unavailable"))?;
+        let settings: Settings = profile_proxy
+            .call("GetSettings", &())
+            .await
+            .map_err(|_| ProfileError("NetworkManager is unavailable"))?;
+        let uuid = settings
+            .get("connection")
+            .and_then(|connection| connection.get("uuid"))
+            .and_then(|value| <&str>::try_from(value).ok())
+            .ok_or(ProfileError(
+                "NetworkManager returned invalid connection settings",
+            ))?;
+        profiles.uuids.insert(uuid.into());
+
+        let is_fortivpn = settings
+            .get("vpn")
+            .and_then(|vpn| vpn.get("service-type"))
+            .and_then(|value| <&str>::try_from(value).ok())
+            == Some(FORTISSLVPN_SERVICE_TYPE);
+        if is_fortivpn {
+            profiles.fortivpn_count += 1;
+        }
+    }
+    Ok(profiles)
+}
+
 fn store_materials(
     state_root: &Path,
     profile_uuid: &str,
     materials: &Materials,
+    maximum_profiles: usize,
 ) -> ProfileResult<StoredMaterials> {
-    if materials.certificate.is_none() && materials.ca_certificate.is_none() {
-        return Ok(StoredMaterials {
-            directory: None,
-            certificate: None,
-            private_key: None,
-            ca_certificate: None,
-        });
+    ensure_private_directory(state_root)?;
+    if maximum_profiles == 0 {
+        return Err(ProfileError(PROFILE_LIMIT_ERROR));
+    }
+    let mut profile_count = 0;
+    for entry in fs::read_dir(state_root)? {
+        entry?;
+        profile_count += 1;
+        if profile_count >= maximum_profiles {
+            return Err(ProfileError(PROFILE_LIMIT_ERROR));
+        }
     }
 
-    ensure_private_directory(state_root)?;
     let directory = state_root.join(profile_uuid);
     let temporary = TempBuilder::new()
         .prefix(".profile-")
@@ -599,6 +695,15 @@ async fn create_profile(
     private_key_password: &str,
     ca_certificate: &[u8],
 ) -> ProfileResult<String> {
+    let connection = zbus::Connection::system()
+        .await
+        .map_err(|_| ProfileError("NetworkManager is unavailable"))?;
+    let network_manager_profiles = network_manager_profiles(&connection).await?;
+    reconcile_profile_storage(state_root, &network_manager_profiles.uuids)?;
+    if network_manager_profiles.fortivpn_count >= MAX_PROFILE_COUNT {
+        return Err(ProfileError(PROFILE_LIMIT_ERROR));
+    }
+
     let materials = parse_materials(
         pkcs12,
         pkcs12_password,
@@ -608,7 +713,7 @@ async fn create_profile(
         ca_certificate,
     )?;
     let profile_uuid = Uuid::new_v4().to_string();
-    let stored = store_materials(state_root, &profile_uuid, &materials)?;
+    let stored = store_materials(state_root, &profile_uuid, &materials, MAX_PROFILE_COUNT)?;
     let settings = match build_settings(parameters, &profile_uuid, &stored) {
         Ok(settings) => settings,
         Err(error) => {
@@ -620,9 +725,6 @@ async fn create_profile(
     };
 
     let result = async {
-        let connection = zbus::Connection::system()
-            .await
-            .map_err(|_| ProfileError("NetworkManager is unavailable"))?;
         let settings_proxy = zbus::Proxy::new(
             &connection,
             NM_BUS_NAME,
@@ -653,7 +755,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state_root = std::env::var_os("GHAF_FORTIVPN_STATE_DIRECTORY")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_ROOT));
-    let service = FortiVpnService { state_root };
+    let service = FortiVpnService {
+        state_root,
+        profile_creation: Mutex::new(()),
+    };
     let _connection = zbus::connection::Builder::system()?
         .name(BUS_NAME)?
         .serve_at(OBJECT_PATH, service)?
@@ -666,6 +771,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn empty_materials() -> Materials {
+        Materials {
+            certificate: None,
+            private_key: None,
+            ca_certificate: None,
+        }
+    }
 
     fn empty_stored_materials() -> StoredMaterials {
         StoredMaterials {
@@ -800,5 +913,62 @@ mod tests {
                 .0,
             "Enter a valid port from 1 to 65535"
         );
+    }
+
+    #[test]
+    fn stores_a_profile_marker_without_certificates() {
+        let state_root = tempfile::tempdir().unwrap();
+
+        let stored = store_materials(state_root.path(), "profile-one", &empty_materials(), 1)
+            .expect("the first profile should fit");
+
+        let directory = stored.directory.expect("profile marker is retained");
+        assert!(directory.is_dir());
+        assert!(stored.certificate.is_none());
+        assert!(stored.private_key.is_none());
+        assert!(stored.ca_certificate.is_none());
+    }
+
+    #[test]
+    fn rejects_profiles_beyond_the_persistent_limit() {
+        let state_root = tempfile::tempdir().unwrap();
+        store_materials(state_root.path(), "profile-one", &empty_materials(), 1)
+            .expect("the first profile should fit");
+
+        let error = store_materials(state_root.path(), "profile-two", &empty_materials(), 1)
+            .err()
+            .expect("the second profile should exceed the limit");
+
+        assert_eq!(error.0, PROFILE_LIMIT_ERROR);
+        assert!(!state_root.path().join("profile-two").exists());
+    }
+
+    #[test]
+    fn rejects_profile_creation_when_no_capacity_is_configured() {
+        let state_root = tempfile::tempdir().unwrap();
+
+        let error = store_materials(state_root.path(), "profile", &empty_materials(), 0)
+            .err()
+            .expect("zero capacity must reject profile creation");
+
+        assert_eq!(error.0, PROFILE_LIMIT_ERROR);
+        assert!(!state_root.path().join("profile").exists());
+    }
+
+    #[test]
+    fn reconciles_profile_storage_with_network_manager() {
+        let state_root = tempfile::tempdir().unwrap();
+        let active_uuid = Uuid::new_v4().to_string();
+        let stale_uuid = Uuid::new_v4().to_string();
+        fs::create_dir(state_root.path().join(&active_uuid)).unwrap();
+        fs::create_dir(state_root.path().join(&stale_uuid)).unwrap();
+        fs::create_dir(state_root.path().join(".profile-interrupted")).unwrap();
+
+        reconcile_profile_storage(state_root.path(), &HashSet::from([active_uuid.clone()]))
+            .unwrap();
+
+        assert!(state_root.path().join(active_uuid).is_dir());
+        assert!(!state_root.path().join(stale_uuid).exists());
+        assert!(!state_root.path().join(".profile-interrupted").exists());
     }
 }
