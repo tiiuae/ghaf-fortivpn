@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: 2026 TII (SSRC) and the Ghaf contributors
+# SPDX-License-Identifier: Apache-2.0
+
+version = 1
+
+SPDX-PackageName = "ghaf-fortivpn"
+SPDX-PackageSupplier = "Technology Innovation Institute <https://tii.ae>"
+SPDX-PackageDownloadLocation = "https://github.com/tiiuae/ghaf-fortivpn"
+
+[[annotations]]
+path = [
+  "gui/Cargo.lock",
+  "service/Cargo.lock",
+]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 TII (SSRC) and the Ghaf contributors"
+SPDX-License-Identifier = "Apache-2.0"

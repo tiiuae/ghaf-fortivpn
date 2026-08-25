@@ -1,0 +1,62 @@
+# SPDX-FileCopyrightText: 2026 TII (SSRC) and the Ghaf contributors
+# SPDX-License-Identifier: Apache-2.0
+
+name: Check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust (${{ matrix.component }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [gui, service]
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libssl-dev libwayland-dev libxkbcommon-dev pkg-config
+
+      - name: Install Rust components
+        run: rustup component add clippy rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --manifest-path ${{ matrix.component }}/Cargo.toml --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --locked --manifest-path ${{ matrix.component }}/Cargo.toml --all-targets -- --deny warnings
+
+      - name: Run tests
+        run: cargo test --locked --manifest-path ${{ matrix.component }}/Cargo.toml
+
+  reuse:
+    name: REUSE compliance
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check license compliance
+        run: pipx run reuse==6.2.0 lint
