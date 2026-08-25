@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: 2026 TII (SSRC) and the Ghaf contributors
+# SPDX-License-Identifier: Apache-2.0
+
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      codeql-action:
+        patterns:
+          - "github/codeql-action*"
+
+  - package-ecosystem: cargo
+    directory: /gui
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: cargo
+    directory: /service
+    schedule:
+      interval: weekly

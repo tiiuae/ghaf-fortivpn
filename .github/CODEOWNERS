@@ -1,0 +1,9 @@
+# SPDX-FileCopyrightText: 2026 TII (SSRC) and the Ghaf contributors
+# SPDX-License-Identifier: Apache-2.0
+
+* @tiiuae/ghaf-maintainers
+
+/service/ @tiiuae/ghaf-security @tiiuae/ghaf-maintainers
+/.github/workflows/ @tiiuae/ghaf-security @tiiuae/ghaf-maintainers
+/.github/CODEOWNERS @tiiuae/ghaf-security @tiiuae/ghaf-maintainers
+/SECURITY.md @tiiuae/ghaf-security
