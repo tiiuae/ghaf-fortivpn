@@ -32,7 +32,7 @@ jobs:
       - name: Install native dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes libssl-dev libwayland-dev libxkbcommon-dev pkg-config
+          sudo apt-get install --yes libssl-dev libopenconnect-dev dbus-daemon libwayland-dev libxkbcommon-dev pkg-config
 
       - name: Install Rust components
         run: rustup component add clippy rustfmt

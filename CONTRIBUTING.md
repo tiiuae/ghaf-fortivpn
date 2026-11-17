@@ -43,4 +43,7 @@ security implications, or behavior are not obvious from the subject.
 ## Licensing
 
 Add SPDX headers to new files. Use Apache-2.0 for source code and configuration
-and CC-BY-SA-4.0 for documentation. Run `reuse lint` before submitting.
+and CC-BY-SA-4.0 for documentation. Use two `//` lines for Rust and C, two
+`#` lines for configuration files, and an HTML comment block for Markdown.
+Leave one blank line after the header. Generated lockfiles are covered by
+`REUSE.toml`. Run `reuse lint` before submitting.

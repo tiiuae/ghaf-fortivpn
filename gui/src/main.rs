@@ -1,7 +1,7 @@
-/*
- * SPDX-FileCopyrightText: 2026 TII (SSRC) and the Ghaf contributors
- * SPDX-License-Identifier: Apache-2.0
- */
+// SPDX-FileCopyrightText: 2026 TII (SSRC) and the Ghaf contributors
+// SPDX-License-Identifier: Apache-2.0
+
+mod auth;
 
 use cosmic::app::{Core, Settings};
 use cosmic::iced::{Alignment, Length, Size};
@@ -300,8 +300,7 @@ impl Application for FortiVpnApp {
                             Some(Message::ToggleVpnPassword),
                             self.hide_vpn_password,
                         )
-                        .on_input(Message::VpnPassword)
-                        .style(dim_placeholder_style()),
+                        .on_input(Message::VpnPassword),
                     )
                     .spacing(4),
             )
@@ -397,8 +396,7 @@ impl Application for FortiVpnApp {
                                         Some(Message::TogglePkcs12Password),
                                         self.hide_pkcs12_password,
                                     )
-                                    .on_input(Message::Pkcs12Password)
-                                    .style(dim_placeholder_style()),
+                                    .on_input(Message::Pkcs12Password),
                                 )
                                 .spacing(4),
                         );
@@ -425,8 +423,7 @@ impl Application for FortiVpnApp {
                                         Some(Message::ToggleKeyPassword),
                                         self.hide_key_password,
                                     )
-                                    .on_input(Message::KeyPassword)
-                                    .style(dim_placeholder_style()),
+                                    .on_input(Message::KeyPassword),
                                 )
                                 .spacing(4),
                         );
@@ -539,65 +536,9 @@ fn labeled_input<'a>(
 ) -> Element<'a, Message> {
     widget::column::with_capacity(2)
         .push(widget::text::body(label))
-        .push(
-            widget::text_input(placeholder, value)
-                .on_input(on_input)
-                .style(dim_placeholder_style()),
-        )
+        .push(widget::text_input(placeholder, value).on_input(on_input))
         .spacing(4)
         .into()
-}
-
-fn dim_placeholder(
-    mut appearance: widget::text_input::Appearance,
-) -> widget::text_input::Appearance {
-    appearance.placeholder_color.a *= 0.45;
-    appearance
-}
-
-fn dim_input_active(theme: &cosmic::Theme) -> widget::text_input::Appearance {
-    dim_placeholder(<cosmic::Theme as widget::text_input::StyleSheet>::active(
-        theme,
-        &cosmic::theme::TextInput::Default,
-    ))
-}
-
-fn dim_input_error(theme: &cosmic::Theme) -> widget::text_input::Appearance {
-    dim_placeholder(<cosmic::Theme as widget::text_input::StyleSheet>::error(
-        theme,
-        &cosmic::theme::TextInput::Default,
-    ))
-}
-
-fn dim_input_hovered(theme: &cosmic::Theme) -> widget::text_input::Appearance {
-    dim_placeholder(<cosmic::Theme as widget::text_input::StyleSheet>::hovered(
-        theme,
-        &cosmic::theme::TextInput::Default,
-    ))
-}
-
-fn dim_input_focused(theme: &cosmic::Theme) -> widget::text_input::Appearance {
-    dim_placeholder(<cosmic::Theme as widget::text_input::StyleSheet>::focused(
-        theme,
-        &cosmic::theme::TextInput::Default,
-    ))
-}
-
-fn dim_input_disabled(theme: &cosmic::Theme) -> widget::text_input::Appearance {
-    dim_placeholder(<cosmic::Theme as widget::text_input::StyleSheet>::disabled(
-        theme,
-        &cosmic::theme::TextInput::Default,
-    ))
-}
-
-fn dim_placeholder_style() -> cosmic::theme::TextInput {
-    cosmic::theme::TextInput::Custom {
-        active: Box::new(dim_input_active),
-        error: Box::new(dim_input_error),
-        hovered: Box::new(dim_input_hovered),
-        focused: Box::new(dim_input_focused),
-        disabled: Box::new(dim_input_disabled),
-    }
 }
 
 fn file_row<'a>(label: &'a str, path: Option<&Path>, message: Message) -> Element<'a, Message> {
@@ -747,6 +688,15 @@ fn dbus_error(error: &zbus::Error) -> String {
     }
 }
 
-fn main() -> cosmic::iced::Result {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut arguments = std::env::args().skip(1);
+    match arguments.next().as_deref() {
+        Some("--auth-agent") => return auth::agent(),
+        Some("--auth-prompt") => {
+            return auth::prompt(&arguments.next().unwrap_or_default()).map_err(Into::into);
+        }
+        _ => {}
+    }
     cosmic::app::run::<FortiVpnApp>(Settings::default().size(Size::new(760.0, 760.0)), ())
+        .map_err(Into::into)
 }
