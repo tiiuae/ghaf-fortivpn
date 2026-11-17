@@ -6,14 +6,15 @@ SPDX-License-Identifier: CC-BY-SA-4.0
 # Ghaf FortiVPN
 
 Ghaf FortiVPN is a native COSMIC application for creating NetworkManager
-FortiSSLVPN profiles in [Ghaf](https://github.com/tiiuae/ghaf).
+Fortinet SSL VPN profiles using OpenConnect in [Ghaf](https://github.com/tiiuae/ghaf).
+It is intended for regular VPN use on Ghaf systems.
 
 The application is split across Ghaf's security boundary:
 
 - `gui/` contains the unprivileged libcosmic frontend that runs in `gui-vm`.
 - `service/` contains the privileged backend that runs in `net-vm`, validates
-  profile and certificate input, stores certificate material, and creates the
-  NetworkManager connection.
+  profile and certificate input, stores certificate material, creates the
+  NetworkManager connection, and authenticates with OpenConnect.
 
 Packaging is maintained separately in
 [`tiiuae/ghafpkgs`](https://github.com/tiiuae/ghafpkgs), while VM deployment,
@@ -32,7 +33,9 @@ The profile form supports:
 - an optional gateway CA certificate.
 
 New profiles appear in **COSMIC Settings → Network & Wireless → VPN**, where
-NetworkManager handles normal connection management.
+NetworkManager handles normal connection management. Connections are saved
+through NetworkManager, and the backend stores their authentication material
+for reuse on subsequent connections and service starts.
 
 ## Architecture
 
@@ -64,7 +67,7 @@ The D-Bus contract currently uses:
 - Certificate inputs have strict size limits and are parsed by the backend
   with OpenSSL.
 - Before creating a profile, the backend removes orphaned application-managed
-  material and permits at most 32 system FortiSSLVPN profiles.
+  material and permits at most 32 OpenConnect Fortinet profiles.
 - The backend checks certificate validity and verifies that a client
   certificate matches its private key.
 - Imported private keys are normalized to unencrypted PKCS#8 and stored as
@@ -77,11 +80,65 @@ interface, sandbox its systemd service, and make the service available only to
 the intended `gui-vm` identity. Those deployment controls are not defined in
 this source repository.
 
+## OpenConnect authentication
+
+Profiles use `org.freedesktop.NetworkManager.openconnect` with
+`protocol=fortinet`. NetworkManager still owns the tunnel, routes, DNS and
+connect/disconnect controls. The existing `CreateProfile` D-Bus method and
+profile-creation form are unchanged.
+
+The service binary provides both the privileged backend and a local
+NetworkManager secret agent (`--agent`). The GUI binary provides a session
+authentication agent (`--auth-agent`) that launches prompts when needed.
+These modes use the same two application binaries.
+
+OpenConnect's tunnel plugin consumes a session cookie, not a saved VPN password.
+The backend therefore stores authentication input in a mode `0600` `auth.json`
+inside each private profile directory. These files include the VPN password;
+protect and persist the existing `/var/lib/ghaf/fortivpn` directory accordingly.
+Certificate import passwords and private-key passphrases are still discarded.
+Changing managed authentication settings through a generic connection editor
+is rejected if they disagree with the private record, to prevent sending saved
+credentials to a substituted gateway. Network settings such as routes and DNS
+remain editable. Use the existing profile form to replace authentication
+settings; a corrected login password entered during authentication is saved
+only after successful authentication.
+
+Authentication runs in a short-lived backend subprocess linked to
+`libopenconnect`. It reads private keys in `net-vm`, uses private pipes for
+credentials and authentication results, and creates no tunnel itself. Each
+attempt is limited to 100 seconds and sixteen prompts; at most four
+connections authenticate concurrently. Cancellation terminates its worker.
+Cookies are returned only to the local NetworkManager agent and marked
+`NOT_SAVED`; they never enter the GUI or a persistent profile.
+
+CA/hostname verification remains enabled. A configured trusted-gateway
+fingerprint is a SHA-256 digest of the complete DER certificate and can accept
+that specific certificate when normal verification fails. The separate
+`gwcert` value passed to the tunnel is OpenConnect's own peer-certificate pin;
+these two formats are deliberately not treated as interchangeable.
+
+The GUI authentication agent displays password retries and the plaintext or
+HTML form challenges supported by OpenConnect's Fortinet implementation. It
+works with the profile-creation window closed. Cancelling or closing the
+prompt cancels that attempt. Gateway-supplied challenge text is displayed as
+plain text. Browser SAML, IPsec, and Fortinet's non-PPP tunnel protocol are not
+implemented by this integration. See [OpenConnect's Fortinet support and
+reconnection limitations](https://www.infradead.org/openconnect/fortinet.html).
+Real-gateway testing is required before claiming compatibility with a particular
+FortiOS version or MFA configuration.
+
 ## Development
 
 Install a current stable Rust toolchain. The GUI additionally requires the
 development libraries for Wayland, `libxkbcommon`, Vulkan, and `pkg-config`.
-The service requires OpenSSL development headers.
+The service requires a C compiler, `pkg-config`, OpenSSL and OpenConnect 9.12
+or later development headers/libraries. Tests also require `dbus-daemon` and
+loopback TCP sockets; they do not use the machine's system NetworkManager.
+Private D-Bus tests cover credential binding and caller authorization. TLS tests
+exercise the real OpenConnect library against a local authentication endpoint,
+including a client-certificate handshake. They do not establish full tunnel or
+real FortiGate interoperability.
 
 Build both components:
 

@@ -1,7 +1,12 @@
-/*
- * SPDX-FileCopyrightText: 2026 TII (SSRC) and the Ghaf contributors
- * SPDX-License-Identifier: Apache-2.0
- */
+// SPDX-FileCopyrightText: 2026 TII (SSRC) and the Ghaf contributors
+// SPDX-License-Identifier: Apache-2.0
+
+mod agent;
+mod auth;
+mod profiles;
+
+#[cfg(test)]
+mod dbus_tests;
 
 use openssl::asn1::Asn1Time;
 use openssl::pkcs12::Pkcs12;
@@ -14,6 +19,7 @@ use std::io::Write;
 use std::net::{IpAddr, Ipv6Addr};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tempfile::Builder as TempBuilder;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -28,7 +34,6 @@ const NM_BUS_NAME: &str = "org.freedesktop.NetworkManager";
 const NM_SETTINGS_PATH: &str = "/org/freedesktop/NetworkManager/Settings";
 const NM_SETTINGS_INTERFACE: &str = "org.freedesktop.NetworkManager.Settings";
 const NM_CONNECTION_INTERFACE: &str = "org.freedesktop.NetworkManager.Settings.Connection";
-const FORTISSLVPN_SERVICE_TYPE: &str = "org.freedesktop.NetworkManager.fortisslvpn";
 const DEFAULT_STATE_ROOT: &str = "/var/lib/ghaf/fortivpn";
 const MAX_BUNDLE_SIZE: usize = 10 * 1024 * 1024;
 const MAX_CERTIFICATE_SIZE: usize = 2 * 1024 * 1024;
@@ -58,7 +63,6 @@ struct Materials {
 }
 
 struct StoredMaterials {
-    directory: Option<PathBuf>,
     certificate: Option<String>,
     private_key: Option<String>,
     ca_certificate: Option<String>,
@@ -82,10 +86,27 @@ struct NetworkManagerProfiles {
 struct FortiVpnService {
     state_root: PathBuf,
     profile_creation: Mutex<()>,
+    authentication: Arc<auth::Authentication>,
 }
 
 #[interface(name = "org.ghaf.FortiVpn1")]
 impl FortiVpnService {
+    async fn pending_authentication(&self, id: String) -> auth::Prompt {
+        self.authentication.prompt(&id).await
+    }
+
+    async fn answer_authentication(
+        &self,
+        id: String,
+        answer: String,
+        cancel: bool,
+    ) -> fdo::Result<()> {
+        self.authentication
+            .answer(&id, answer, cancel)
+            .await
+            .map_err(|error| fdo::Error::Failed(error.0.into()))
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn create_profile(
         &self,
@@ -439,12 +460,7 @@ async fn network_manager_profiles(
             ))?;
         profiles.uuids.insert(uuid.into());
 
-        let is_fortivpn = settings
-            .get("vpn")
-            .and_then(|vpn| vpn.get("service-type"))
-            .and_then(|value| <&str>::try_from(value).ok())
-            == Some(FORTISSLVPN_SERVICE_TYPE);
-        if is_fortivpn {
+        if profiles::is_openconnect_fortinet(&settings) {
             profiles.fortivpn_count += 1;
         }
     }
@@ -474,6 +490,7 @@ fn store_materials(
     let temporary = TempBuilder::new()
         .prefix(".profile-")
         .tempdir_in(state_root)?;
+    ensure_private_directory(temporary.path())?;
 
     let certificate = materials
         .certificate
@@ -514,7 +531,6 @@ fn store_materials(
     fs::rename(temporary.path(), &directory)?;
 
     Ok(StoredMaterials {
-        directory: Some(directory),
         certificate,
         private_key,
         ca_certificate,
@@ -603,7 +619,6 @@ fn build_settings(
     let gateway = parameters.gateway.trim();
     let realm = parameters.realm.trim();
     let username = parameters.username.trim();
-    let trusted_certificate = parameters.trusted_certificate.trim();
 
     validate_plain_text(
         name,
@@ -625,7 +640,6 @@ fn build_settings(
             "Enter a VPN password or provide a client certificate",
         ));
     }
-    let trusted_certificate = normalize_fingerprint(trusted_certificate)?;
 
     let mut connection = Setting::new();
     connection.insert("id".into(), string_value(name));
@@ -633,43 +647,17 @@ fn build_settings(
     connection.insert("type".into(), string_value("vpn"));
     connection.insert("autoconnect".into(), OwnedValue::from(false));
 
-    let gateway = if gateway.parse::<Ipv6Addr>().is_ok() {
-        format!("[{gateway}]:{}", parameters.port)
-    } else {
-        format!("{gateway}:{}", parameters.port)
-    };
-    let mut data = HashMap::<String, String>::new();
-    data.insert("gateway".into(), gateway);
-    data.insert("user".into(), username.into());
-    if !realm.is_empty() {
-        data.insert("realm".into(), realm.into());
-    }
-    if let Some(fingerprint) = trusted_certificate {
-        data.insert("trusted-cert".into(), fingerprint);
-    }
-    if let Some(path) = &stored.certificate {
-        data.insert("cert".into(), path.clone());
-    }
-    if let Some(path) = &stored.private_key {
-        data.insert("key".into(), path.clone());
-    }
-    if let Some(path) = &stored.ca_certificate {
-        data.insert("ca".into(), path.clone());
-    }
-
-    let mut secrets = HashMap::<String, String>::new();
-    if !parameters.password.is_empty() {
-        data.insert("password-flags".into(), "0".into());
-        secrets.insert("password".into(), parameters.password.into());
-    }
-
+    let credentials = profiles::config(parameters, stored)?;
     let mut vpn = Setting::new();
+    vpn.insert("service-type".into(), string_value(profiles::SERVICE_TYPE));
     vpn.insert(
-        "service-type".into(),
-        string_value(FORTISSLVPN_SERVICE_TYPE),
+        "data".into(),
+        OwnedValue::from(profiles::data(&credentials)),
     );
-    vpn.insert("data".into(), OwnedValue::from(data));
-    vpn.insert("secrets".into(), OwnedValue::from(secrets));
+    vpn.insert(
+        "secrets".into(),
+        OwnedValue::from(HashMap::<String, String>::new()),
+    );
 
     let mut ipv4 = Setting::new();
     ipv4.insert("method".into(), string_value("auto"));
@@ -714,17 +702,13 @@ async fn create_profile(
     )?;
     let profile_uuid = Uuid::new_v4().to_string();
     let stored = store_materials(state_root, &profile_uuid, &materials, MAX_PROFILE_COUNT)?;
-    let settings = match build_settings(parameters, &profile_uuid, &stored) {
-        Ok(settings) => settings,
-        Err(error) => {
-            if let Some(directory) = &stored.directory {
-                let _ = fs::remove_dir_all(directory);
-            }
-            return Err(error);
-        }
-    };
-
     let result = async {
+        let settings = build_settings(parameters, &profile_uuid, &stored)?;
+        let credentials = profiles::config(parameters, &stored)?;
+        auth::save(
+            &state_root.join(&profile_uuid).join("auth.json"),
+            &credentials,
+        )?;
         let settings_proxy = zbus::Proxy::new(
             &connection,
             NM_BUS_NAME,
@@ -742,30 +726,62 @@ async fn create_profile(
     .await;
 
     if result.is_err() {
-        if let Some(directory) = &stored.directory {
-            let _ = fs::remove_dir_all(directory);
-        }
-        return result.map(|()| profile_uuid);
+        let _ = fs::remove_dir_all(state_root.join(&profile_uuid));
     }
-    Ok(profile_uuid)
+    result.map(|()| profile_uuid)
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mode = std::env::args().nth(1);
+    if mode.as_deref() == Some("--authenticate-worker") {
+        return auth::worker().map_err(|()| "VPN authentication failed".into());
+    }
+    run(mode)
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn run(mode: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    if mode.as_deref() == Some("--agent") {
+        return agent::run().await;
+    }
     let state_root = std::env::var_os("GHAF_FORTIVPN_STATE_DIRECTORY")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_ROOT));
+    if mode.is_some() {
+        return Err("Unknown service argument".into());
+    }
+    let authentication = Arc::new(auth::Authentication::default());
     let service = FortiVpnService {
-        state_root,
+        state_root: state_root.clone(),
         profile_creation: Mutex::new(()),
+        authentication: authentication.clone(),
     };
-    let _connection = zbus::connection::Builder::system()?
+    let connection = zbus::connection::Builder::system()?
         .name(BUS_NAME)?
+        .name(agent::BACKEND_NAME)?
         .serve_at(OBJECT_PATH, service)?
+        .serve_at(
+            agent::BACKEND_PATH,
+            agent::Backend {
+                state_root,
+                authentication: authentication.clone(),
+            },
+        )?
         .build()
         .await?;
-    std::future::pending::<()>().await;
-    Ok(())
+    let mut network_manager_owner = String::new();
+    loop {
+        if let Ok(owner) = agent::owner(&connection, NM_BUS_NAME).await {
+            if owner != network_manager_owner {
+                authentication.cancel_all().await;
+                network_manager_owner = owner;
+            }
+        } else {
+            authentication.cancel_all().await;
+            network_manager_owner.clear();
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
 }
 
 #[cfg(test)]
@@ -782,7 +798,6 @@ mod tests {
 
     fn empty_stored_materials() -> StoredMaterials {
         StoredMaterials {
-            directory: None,
             certificate: None,
             private_key: None,
             ca_certificate: None,
@@ -922,8 +937,7 @@ mod tests {
         let stored = store_materials(state_root.path(), "profile-one", &empty_materials(), 1)
             .expect("the first profile should fit");
 
-        let directory = stored.directory.expect("profile marker is retained");
-        assert!(directory.is_dir());
+        assert!(state_root.path().join("profile-one").is_dir());
         assert!(stored.certificate.is_none());
         assert!(stored.private_key.is_none());
         assert!(stored.ca_certificate.is_none());
