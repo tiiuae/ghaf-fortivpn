@@ -14,7 +14,6 @@ use tokio::sync::{Mutex, oneshot, watch};
 use zeroize::{Zeroize, Zeroizing};
 
 const MAX_FRAME: usize = 65536;
-// Leave time for D-Bus replies before NetworkManager's 120-second GetSecrets deadline.
 pub const AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(100);
 
 #[derive(Serialize, Deserialize)]
@@ -86,12 +85,6 @@ impl Authentication {
         Ok(())
     }
 
-    pub async fn cancel_all(&self) {
-        for cancel in self.active.lock().await.values() {
-            let _ = cancel.send(true);
-        }
-    }
-
     pub async fn cancel(&self, path: &str) {
         if let Some(cancel) = self.active.lock().await.get(path) {
             let _ = cancel.send(true);
@@ -101,8 +94,10 @@ impl Authentication {
     pub async fn run(
         &self,
         path: &str,
-        credentials: impl Future<Output = ProfileResult<(String, Credentials, std::path::PathBuf)>>,
-        interaction: bool,
+        state_root: &Path,
+        settings: &crate::Settings,
+        connection: &zbus::Connection,
+        sender: &str,
     ) -> ProfileResult<HashMap<String, String>> {
         let (cancel, mut cancelled) = watch::channel(false);
         {
@@ -114,13 +109,29 @@ impl Authentication {
         }
         let request = uuid::Uuid::new_v4().to_string();
         let authentication = async {
-            let (name, credentials, credentials_path) = credentials.await?;
-            self.worker(&request, &name, credentials, interaction, &credentials_path)
+            let (name, credentials, credentials_path) =
+                crate::profiles::credentials(state_root, settings)?;
+            self.worker(&request, &name, credentials, connection, &credentials_path)
                 .await
+        };
+        let plugin_gone = async {
+            let Ok(bus) = zbus::fdo::DBusProxy::new(connection).await else {
+                return;
+            };
+            let Ok(name) = zbus::names::BusName::try_from(sender) else {
+                return;
+            };
+            loop {
+                if !bus.name_has_owner(name.clone()).await.unwrap_or(false) {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
         };
         let result = tokio::select! {
             result = tokio::time::timeout(AUTH_TIMEOUT, authentication) =>
                 result.unwrap_or(Err(ProfileError("VPN authentication timed out"))),
+            _ = plugin_gone => Err(ProfileError("VPN plugin disconnected")),
             _ = cancelled.changed() => Err(ProfileError("VPN authentication was cancelled")),
         };
         self.pending
@@ -136,7 +147,7 @@ impl Authentication {
         id: &str,
         name: &str,
         mut credentials: Credentials,
-        interaction: bool,
+        connection: &zbus::Connection,
         credentials_path: &Path,
     ) -> ProfileResult<HashMap<String, String>> {
         let mut child = Command::new(std::env::current_exe()?)
@@ -172,7 +183,7 @@ impl Authentication {
             match event {
                 Event::Prompt { label, secret } => {
                     prompts += 1;
-                    if !interaction || prompts > 16 {
+                    if prompts > 16 {
                         return Err(ProfileError("VPN authentication requires user interaction"));
                     }
                     let prompt_id = format!("{id}:{prompts}");
@@ -184,6 +195,16 @@ impl Authentication {
                             answer: send,
                         },
                     );
+                    connection
+                        .emit_signal(
+                            None::<&str>,
+                            crate::OBJECT_PATH,
+                            "org.ghaf.FortiVpn1",
+                            "AuthenticationPending",
+                            &(),
+                        )
+                        .await
+                        .map_err(|_| ProfileError("Could not notify the desktop"))?;
                     let answer = receive
                         .await
                         .ok()
@@ -532,8 +553,6 @@ mod tests {
         a.changed().await.unwrap();
         assert!(*a.borrow());
         assert!(!*b.borrow());
-        auth.cancel_all().await;
-        assert!(*b.borrow());
     }
 
     #[tokio::test]

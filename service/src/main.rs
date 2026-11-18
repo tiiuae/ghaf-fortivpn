@@ -1,12 +1,11 @@
 // SPDX-FileCopyrightText: 2026 TII (SSRC) and the Ghaf contributors
 // SPDX-License-Identifier: Apache-2.0
 
-mod agent;
 mod auth;
 mod profiles;
 
 #[cfg(test)]
-mod dbus_tests;
+mod profile_tests;
 
 use openssl::asn1::Asn1Time;
 use openssl::pkcs12::Pkcs12;
@@ -91,7 +90,13 @@ struct FortiVpnService {
 
 #[interface(name = "org.ghaf.FortiVpn1")]
 impl FortiVpnService {
-    async fn pending_authentication(&self, id: String) -> auth::Prompt {
+    #[zbus(signal)]
+    async fn authentication_pending(
+        emitter: &zbus::object_server::SignalEmitter<'_>,
+    ) -> zbus::Result<()>;
+
+    #[zbus(out_args("request", "profile", "label", "secret"))]
+    async fn pending_authentication(&self, id: String) -> (String, String, String, bool) {
         self.authentication.prompt(&id).await
     }
 
@@ -649,6 +654,7 @@ fn build_settings(
 
     let credentials = profiles::config(parameters, stored)?;
     let mut vpn = Setting::new();
+    vpn.insert("timeout".into(), OwnedVariant::from(180u32));
     vpn.insert("service-type".into(), string_value(profiles::SERVICE_TYPE));
     vpn.insert(
         "data".into(),
@@ -731,57 +737,88 @@ async fn create_profile(
     result.map(|()| profile_uuid)
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mode = std::env::args().nth(1);
-    if mode.as_deref() == Some("--authenticate-worker") {
-        return auth::worker().map_err(|()| "VPN authentication failed".into());
+struct Plugin {
+    state_root: PathBuf,
+    authentication: Arc<auth::Authentication>,
+}
+
+async fn root_sender(
+    connection: &zbus::Connection,
+    header: &zbus::message::Header<'_>,
+) -> fdo::Result<String> {
+    let denied = || fdo::Error::AccessDenied("Only the local VPN plugin may authenticate".into());
+    let sender = header.sender().ok_or_else(denied)?;
+    let bus = fdo::DBusProxy::new(connection).await?;
+    if bus.get_connection_unix_user(sender.clone().into()).await? != 0 {
+        return Err(denied());
     }
-    run(mode)
+    Ok(sender.to_string())
+}
+
+#[interface(name = "org.ghaf.FortiVpn.Authentication1")]
+impl Plugin {
+    async fn authenticate(
+        &self,
+        settings: Settings,
+        #[zbus(connection)] connection: &zbus::Connection,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> fdo::Result<HashMap<String, String>> {
+        let caller = root_sender(connection, &header).await?;
+        let uuid = profiles::value(&settings, "connection", "uuid")
+            .ok_or_else(|| fdo::Error::InvalidArgs("Missing profile UUID".into()))?;
+        self.authentication
+            .run(uuid, &self.state_root, &settings, connection, &caller)
+            .await
+            .map_err(|e| fdo::Error::Failed(e.0.into()))
+    }
+
+    async fn cancel(
+        &self,
+        uuid: String,
+        #[zbus(connection)] connection: &zbus::Connection,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> fdo::Result<()> {
+        root_sender(connection, &header).await?;
+        self.authentication.cancel(&uuid).await;
+        Ok(())
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    match std::env::args().nth(1).as_deref() {
+        Some("--authenticate-worker") => {
+            auth::worker().map_err(|()| "VPN authentication failed".into())
+        }
+        None => run(),
+        _ => Err("Unknown service argument".into()),
+    }
 }
 
 #[tokio::main]
-async fn run(mode: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
-    if mode.as_deref() == Some("--agent") {
-        return agent::run().await;
-    }
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let state_root = std::env::var_os("GHAF_FORTIVPN_STATE_DIRECTORY")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_ROOT));
-    if mode.is_some() {
-        return Err("Unknown service argument".into());
-    }
     let authentication = Arc::new(auth::Authentication::default());
     let service = FortiVpnService {
         state_root: state_root.clone(),
         profile_creation: Mutex::new(()),
         authentication: authentication.clone(),
     };
-    let connection = zbus::connection::Builder::system()
+    let _connection = zbus::connection::Builder::system()
         .name(BUS_NAME)
-        .name(agent::BACKEND_NAME)
+        .name("org.ghaf.FortiVpn.Authentication")
         .serve_at(OBJECT_PATH, service)
         .serve_at(
-            agent::BACKEND_PATH,
-            agent::Backend {
+            "/org/ghaf/FortiVpnAuthentication",
+            Plugin {
                 state_root,
-                authentication: authentication.clone(),
+                authentication,
             },
         )
         .build()
         .await?;
-    let mut network_manager_owner = String::new();
-    loop {
-        if let Ok(owner) = agent::owner(&connection, NM_BUS_NAME).await {
-            if owner != network_manager_owner {
-                authentication.cancel_all().await;
-                network_manager_owner = owner;
-            }
-        } else {
-            authentication.cancel_all().await;
-            network_manager_owner.clear();
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    }
+    std::future::pending().await
 }
 
 #[cfg(test)]

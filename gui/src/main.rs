@@ -691,7 +691,7 @@ fn dbus_error(error: &zbus::Error) -> String {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = std::env::args().skip(1);
     match arguments.next().as_deref() {
-        Some("--auth-agent") => return auth::agent(),
+        Some("--present-pending") => return auth::present_pending(),
         Some("--auth-prompt") => {
             return auth::prompt(&arguments.next().unwrap_or_default()).map_err(Into::into);
         }

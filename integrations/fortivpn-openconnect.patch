@@ -1,0 +1,121 @@
+# SPDX-FileCopyrightText: 2026 TII (SSRC) and the Ghaf contributors
+# SPDX-License-Identifier: GPL-2.0-only
+
+--- a/src/nm-openconnect-service.c
++++ b/src/nm-openconnect-service.c
+@@ -53,6 +53,7 @@
+ 
+ typedef struct {
+ 	GPid pid;
++	GTask *authentication;
+ 	char *tun_name;
+ } NMOpenconnectPluginPrivate;
+ 
+@@ -611,6 +612,53 @@
+ 
+ 	return 0;
+ }
++#define GHAF_AUTH_NAME "org.ghaf.FortiVpn.Authentication"
++#define GHAF_AUTH_PATH "/org/ghaf/FortiVpnAuthentication"
++#define GHAF_AUTH_IFACE "org.ghaf.FortiVpn.Authentication1"
++
++static gboolean
++ghaf_manages_profile (NMConnection *connection)
++{
++	const char *uuid = nm_connection_get_uuid (connection);
++	g_autofree char *record = NULL;
++
++	if (!uuid || !g_uuid_string_is_valid (uuid))
++		return FALSE;
++	record = g_build_filename ("/var/lib/ghaf/fortivpn", uuid, "auth.json", NULL);
++	return g_file_test (record, G_FILE_TEST_IS_REGULAR);
++}
++
++static void
++ghaf_authenticated (GObject *source, GAsyncResult *res, gpointer user_data)
++{
++	g_autoptr(GTask) task = user_data;
++	NMOpenconnectPlugin *plugin = g_task_get_source_object (task);
++	NMOpenconnectPluginPrivate *priv = NM_OPENCONNECT_PLUGIN_GET_PRIVATE (plugin);
++	NMConnection *connection = g_task_get_task_data (task);
++	NMSettingVpn *vpn = nm_connection_get_setting_vpn (connection);
++	g_autoptr(GError) error = NULL;
++	g_autoptr(GVariant) reply = g_dbus_connection_call_finish (G_DBUS_CONNECTION (source), res, &error);
++	g_autoptr(GVariant) dict = NULL;
++	GVariantIter iter;
++	const char *key, *value;
++
++	if (priv->authentication != task)
++		return;
++	priv->authentication = NULL;
++	if (!reply) {
++		nm_vpn_service_plugin_failure (NM_VPN_SERVICE_PLUGIN (plugin), NM_VPN_PLUGIN_FAILURE_LOGIN_FAILED);
++		return;
++	}
++	nm_connection_clear_secrets (connection);
++	dict = g_variant_get_child_value (reply, 0);
++	g_variant_iter_init (&iter, dict);
++	while (g_variant_iter_next (&iter, "{&s&s}", &key, &value))
++		nm_setting_vpn_add_secret (vpn, key, value);
++	if (nm_openconnect_start_openconnect_binary (plugin, nm_connection_get_setting_connection (connection),
++	                                            vpn, &error) != 0)
++		nm_vpn_service_plugin_failure (NM_VPN_SERVICE_PLUGIN (plugin), NM_VPN_PLUGIN_FAILURE_CONNECT_FAILED);
++}
++
+ static gboolean
+ real_connect (NMVpnServicePlugin   *plugin,
+               NMConnection  *connection,
+@@ -626,6 +674,24 @@
+ 		goto out;
+ 	s_vpn = nm_connection_get_setting_vpn (connection);
+ 	g_assert (s_vpn);
++	if (ghaf_manages_profile (connection)) {
++		NMOpenconnectPluginPrivate *priv = NM_OPENCONNECT_PLUGIN_GET_PRIVATE (plugin);
++		g_autoptr(GDBusConnection) bus = nm_vpn_service_plugin_get_connection (plugin);
++		g_autoptr(GCancellable) cancel = g_cancellable_new ();
++		GTask *task;
++
++		if (priv->authentication || !bus ||
++		    !nm_openconnect_properties_validate (s_vpn, error))
++			goto out;
++		task = g_task_new (plugin, cancel, NULL, NULL);
++		g_task_set_task_data (task, nm_simple_connection_new_clone (connection), g_object_unref);
++		priv->authentication = task;
++		g_dbus_connection_call (bus, GHAF_AUTH_NAME, GHAF_AUTH_PATH, GHAF_AUTH_IFACE, "Authenticate",
++		                        g_variant_new ("(@a{sa{sv}})", nm_connection_to_dbus (connection, NM_CONNECTION_SERIALIZE_NO_SECRETS)),
++		                        G_VARIANT_TYPE ("(a{ss})"), G_DBUS_CALL_FLAGS_NONE, 110000,
++		                        cancel, ghaf_authenticated, task);
++		return TRUE;
++	}
+ 	if (!nm_openconnect_properties_validate (s_vpn, error))
+ 		goto out;
+ 	if (!nm_openconnect_secrets_validate (s_vpn, error))
+@@ -663,6 +729,9 @@
+ 		return FALSE;
+ 	}
+ 
++	if (ghaf_manages_profile (connection))
++		return FALSE;
++
+ 	/* We just need the WebVPN cookie, and the final IP address of the gateway
+ 	   (after HTTP redirects, which do happen). All the certificate/SecurID
+ 	   nonsense can be handled for us, in the user's context, by auth-dialog */
+@@ -698,6 +767,18 @@
+ {
+ 	NMOpenconnectPluginPrivate *priv = NM_OPENCONNECT_PLUGIN_GET_PRIVATE (plugin);
+ 
++	if (priv->authentication) {
++		GTask *task = priv->authentication;
++		NMConnection *connection = g_task_get_task_data (task);
++		g_autoptr(GDBusConnection) bus = nm_vpn_service_plugin_get_connection (plugin);
++
++		priv->authentication = NULL;
++		g_cancellable_cancel (g_task_get_cancellable (task));
++		if (bus)
++			g_dbus_connection_call (bus, GHAF_AUTH_NAME, GHAF_AUTH_PATH, GHAF_AUTH_IFACE, "Cancel",
++			                        g_variant_new ("(s)", nm_connection_get_uuid (connection)),
++			                        NULL, G_DBUS_CALL_FLAGS_NONE, -1, NULL, NULL, NULL);
++	}
+ 	if (priv->pid) {
+ 		if (kill (priv->pid, SIGINT) == 0)
+ 			g_timeout_add (2000, ensure_killed, GINT_TO_POINTER (priv->pid));
