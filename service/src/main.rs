@@ -25,7 +25,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 use zbus::fdo;
 use zbus::interface;
-use zbus::zvariant::{OwnedObjectPath, OwnedValue, Str};
+use zbus::{OwnedObjectPath, OwnedVariant, Str};
 use zeroize::Zeroizing;
 
 const BUS_NAME: &str = "org.ghaf.FortiVpn";
@@ -42,7 +42,7 @@ const MAX_PASSWORD_SIZE: usize = 4096;
 const MAX_PROFILE_COUNT: usize = 32;
 const PROFILE_LIMIT_ERROR: &str = "The maximum number of VPN profiles has been reached";
 
-type Setting = HashMap<String, OwnedValue>;
+type Setting = HashMap<String, OwnedVariant>;
 type Settings = HashMap<String, Setting>;
 
 #[derive(Debug)]
@@ -606,8 +606,8 @@ fn normalize_fingerprint(value: &str) -> ProfileResult<Option<String>> {
     Ok(Some(normalized.to_ascii_lowercase()))
 }
 
-fn string_value(value: impl Into<String>) -> OwnedValue {
-    OwnedValue::from(Str::from(value.into()))
+fn string_value(value: impl Into<String>) -> OwnedVariant {
+    OwnedVariant::from(Str::from(value.into()))
 }
 
 fn build_settings(
@@ -645,18 +645,18 @@ fn build_settings(
     connection.insert("id".into(), string_value(name));
     connection.insert("uuid".into(), string_value(profile_uuid));
     connection.insert("type".into(), string_value("vpn"));
-    connection.insert("autoconnect".into(), OwnedValue::from(false));
+    connection.insert("autoconnect".into(), OwnedVariant::from(false));
 
     let credentials = profiles::config(parameters, stored)?;
     let mut vpn = Setting::new();
     vpn.insert("service-type".into(), string_value(profiles::SERVICE_TYPE));
     vpn.insert(
         "data".into(),
-        OwnedValue::from(profiles::data(&credentials)),
+        OwnedVariant::from(profiles::data(&credentials)),
     );
     vpn.insert(
         "secrets".into(),
-        OwnedValue::from(HashMap::<String, String>::new()),
+        OwnedVariant::from(HashMap::<String, String>::new()),
     );
 
     let mut ipv4 = Setting::new();
@@ -756,17 +756,17 @@ async fn run(mode: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
         profile_creation: Mutex::new(()),
         authentication: authentication.clone(),
     };
-    let connection = zbus::connection::Builder::system()?
-        .name(BUS_NAME)?
-        .name(agent::BACKEND_NAME)?
-        .serve_at(OBJECT_PATH, service)?
+    let connection = zbus::connection::Builder::system()
+        .name(BUS_NAME)
+        .name(agent::BACKEND_NAME)
+        .serve_at(OBJECT_PATH, service)
         .serve_at(
             agent::BACKEND_PATH,
             agent::Backend {
                 state_root,
                 authentication: authentication.clone(),
             },
-        )?
+        )
         .build()
         .await?;
     let mut network_manager_owner = String::new();

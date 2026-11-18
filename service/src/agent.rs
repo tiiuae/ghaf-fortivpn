@@ -5,11 +5,7 @@ use crate::{NM_BUS_NAME, Setting, Settings, auth, profiles};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use zbus::{
-    fdo, interface,
-    message::Header,
-    zvariant::{OwnedObjectPath, OwnedValue},
-};
+use zbus::{OwnedObjectPath, OwnedVariant, fdo, interface, message::Header};
 
 pub const AGENT_NAME: &str = "org.ghaf.FortiVpn.Agent";
 pub const BACKEND_NAME: &str = "org.ghaf.FortiVpn.Authentication";
@@ -130,17 +126,20 @@ impl Agent {
             .call("Authenticate", &(path, flags))
             .await
             .map_err(|error| match error {
-                zbus::Error::MethodError(_, Some(message), _)
-                    if message == "VPN authentication was cancelled" =>
-                {
-                    AgentError::UserCanceled(message)
-                }
-                zbus::Error::MethodError(_, Some(message), _) => AgentError::NoSecrets(message),
+                zbus::Error::FDO(error) => match *error {
+                    fdo::Error::Failed(message)
+                        if message == "VPN authentication was cancelled" =>
+                    {
+                        AgentError::UserCanceled(message)
+                    }
+                    fdo::Error::Failed(message) => AgentError::NoSecrets(message),
+                    _ => AgentError::Failed("VPN authentication failed".into()),
+                },
                 _ => AgentError::Failed("VPN authentication failed".into()),
             })?;
         Ok(HashMap::from([(
             "vpn".into(),
-            Setting::from([("secrets".into(), OwnedValue::from(secrets))]),
+            Setting::from([("secrets".into(), OwnedVariant::from(secrets))]),
         )]))
     }
 
@@ -183,10 +182,10 @@ impl Agent {
 }
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let connection = zbus::connection::Builder::system()?
+    let connection = zbus::connection::Builder::system()
         .method_timeout(auth::AUTH_TIMEOUT + std::time::Duration::from_secs(10))
-        .name(AGENT_NAME)?
-        .serve_at(AGENT_PATH, Agent)?
+        .name(AGENT_NAME)
+        .serve_at(AGENT_PATH, Agent)
         .build()
         .await?;
     let mut registered_owner = String::new();

@@ -29,7 +29,6 @@ impl Bus {
     }
     async fn connection(&self) -> zbus::Connection {
         zbus::connection::Builder::address(self.address.as_str())
-            .unwrap()
             .build()
             .await
             .unwrap()
@@ -100,16 +99,13 @@ async fn credentials_are_bound_to_the_managed_gateway() {
         build_settings(&parameters, &uuid, &stored).unwrap(),
     ));
     let _nm = zbus::connection::Builder::address(bus.address.as_str())
-        .unwrap()
         .name(NM_BUS_NAME)
-        .unwrap()
         .serve_at(
             PATH,
             NmProfile {
                 settings: settings.clone(),
             },
         )
-        .unwrap()
         .build()
         .await
         .unwrap();
@@ -133,7 +129,7 @@ async fn credentials_are_bound_to_the_managed_gateway() {
         settings
             .get_mut("vpn")
             .unwrap()
-            .insert("data".into(), OwnedValue::from(data));
+            .insert("data".into(), OwnedVariant::from(data));
     }
     assert_eq!(
         profiles::credentials(&client, root.path(), &path)
@@ -150,9 +146,7 @@ async fn authentication_backend_rejects_callers_without_the_local_agent_identity
     let bus = Bus::new();
     let root = tempfile::tempdir().unwrap();
     let _server = zbus::connection::Builder::address(bus.address.as_str())
-        .unwrap()
         .name(agent::BACKEND_NAME)
-        .unwrap()
         .serve_at(
             agent::BACKEND_PATH,
             agent::Backend {
@@ -160,7 +154,6 @@ async fn authentication_backend_rejects_callers_without_the_local_agent_identity
                 authentication: Arc::default(),
             },
         )
-        .unwrap()
         .build()
         .await
         .unwrap();
@@ -180,7 +173,7 @@ async fn authentication_backend_rejects_callers_without_the_local_agent_identity
         )
         .await;
     assert!(
-        matches!(response, Err(zbus::Error::MethodError(name, _, _)) if name.as_str() == "org.freedesktop.DBus.Error.AccessDenied")
+        matches!(response, Err(zbus::Error::FDO(error)) if matches!(*error, fdo::Error::AccessDenied(_)))
     );
 }
 
@@ -188,18 +181,13 @@ async fn authentication_backend_rejects_callers_without_the_local_agent_identity
 async fn secret_agent_rejects_other_callers_and_leaves_unrelated_connections_alone() {
     let bus = Bus::new();
     let agent = zbus::connection::Builder::address(bus.address.as_str())
-        .unwrap()
         .name(agent::AGENT_NAME)
-        .unwrap()
         .serve_at("/org/freedesktop/NetworkManager/SecretAgent", agent::Agent)
-        .unwrap()
         .build()
         .await
         .unwrap();
     let manager = zbus::connection::Builder::address(bus.address.as_str())
-        .unwrap()
         .name(NM_BUS_NAME)
-        .unwrap()
         .build()
         .await
         .unwrap();
