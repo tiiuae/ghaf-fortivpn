@@ -29,7 +29,7 @@ fn answer(id: &str, value: &str, cancel: bool) -> zbus::Result<()> {
     proxy(&connection)?.call("AnswerAuthentication", &(id, value, cancel))
 }
 
-pub fn agent() -> Result<(), Box<dyn std::error::Error>> {
+pub fn present_pending() -> Result<(), Box<dyn std::error::Error>> {
     let executable = std::env::current_exe()?;
     let mut active: Option<(String, Child)> = None;
     loop {
@@ -37,14 +37,16 @@ pub fn agent() -> Result<(), Box<dyn std::error::Error>> {
             if child.try_wait()?.is_some() {
                 let _ = answer(id, "", true);
                 active = None;
-            } else if pending(id).is_ok_and(|prompt| prompt.0.is_empty()) {
+            } else if pending(id).map_or(true, |prompt| prompt.0.is_empty()) {
                 let _ = child.kill();
                 let _ = child.wait();
                 active = None;
             }
-        } else if let Ok(prompt) = pending("")
-            && !prompt.0.is_empty()
-        {
+        } else {
+            let prompt = pending("")?;
+            if prompt.0.is_empty() {
+                return Ok(());
+            }
             let child = Command::new(&executable)
                 .arg("--auth-prompt")
                 .arg(&prompt.0)

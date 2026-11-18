@@ -87,10 +87,10 @@ Profiles use `org.freedesktop.NetworkManager.openconnect` with
 connect/disconnect controls. The existing `CreateProfile` D-Bus method and
 profile-creation form are unchanged.
 
-The service binary provides both the privileged backend and a local
-NetworkManager secret agent (`--agent`). The GUI binary provides a session
-authentication agent (`--auth-agent`) that launches prompts when needed.
-These modes use the same two application binaries.
+The net-VM OpenConnect plugin calls the existing backend on demand for managed
+profiles. The desktop listens for `AuthenticationPending` and invokes
+`ghaf-fortivpn --present-pending` to display outstanding password or MFA
+requests. Both helpers exit after the operation.
 
 OpenConnect's tunnel plugin consumes a session cookie, not a saved VPN password.
 The backend therefore stores authentication input in a mode `0600` `auth.json`
@@ -109,8 +109,7 @@ Authentication runs in a short-lived backend subprocess linked to
 credentials and authentication results, and creates no tunnel itself. Each
 attempt is limited to 100 seconds and sixteen prompts; at most four
 connections authenticate concurrently. Cancellation terminates its worker.
-Cookies are returned only to the local NetworkManager agent and marked
-`NOT_SAVED`; they never enter the GUI or a persistent profile.
+Cookies are returned only to the local tunnel plugin; they never enter the GUI or a persistent profile.
 
 CA/hostname verification remains enabled. A configured trusted-gateway
 fingerprint is a SHA-256 digest of the complete DER certificate and can accept
@@ -118,7 +117,7 @@ that specific certificate when normal verification fails. The separate
 `gwcert` value passed to the tunnel is OpenConnect's own peer-certificate pin;
 these two formats are deliberately not treated as interchangeable.
 
-The GUI authentication agent displays password retries and the plaintext or
+The on-demand GUI displays password retries and the plaintext or
 HTML form challenges supported by OpenConnect's Fortinet implementation. It
 works with the profile-creation window closed. Cancelling or closing the
 prompt cancels that attempt. Gateway-supplied challenge text is displayed as
@@ -128,14 +127,16 @@ reconnection limitations](https://www.infradead.org/openconnect/fortinet.html).
 Real-gateway testing is required before claiming compatibility with a particular
 FortiOS version or MFA configuration.
 
+The [integration sources](integrations/) connect the NetworkManager OpenConnect plugin to the
+backend and the COSMIC settings daemon to the prompt helper. The `ghafpkgs` flake builds both
+hooks from the same revision as the application.
+
 ## Development
 
 Install a current stable Rust toolchain. The GUI additionally requires the
 development libraries for Wayland, `libxkbcommon`, Vulkan, and `pkg-config`.
 The service requires a C compiler, `pkg-config`, OpenSSL and OpenConnect 9.12
-or later development headers/libraries. Tests also require `dbus-daemon` and
-loopback TCP sockets; they do not use the machine's system NetworkManager.
-Private D-Bus tests cover credential binding and caller authorization. TLS tests
+or later development headers/libraries. The TLS tests require loopback TCP sockets. Profile tests cover credential binding. TLS tests
 exercise the real OpenConnect library against a local authentication endpoint,
 including a client-certificate handshake. They do not establish full tunnel or
 real FortiGate interoperability.
@@ -170,8 +171,8 @@ through a public issue.
 
 ## License
 
-Source code is licensed under Apache-2.0. Documentation is licensed under
-CC-BY-SA-4.0. See [LICENSES](LICENSES/) for the full license texts.
+Application code and the COSMIC integration use Apache-2.0. The NetworkManager
+OpenConnect patch uses GPL-2.0-only. Documentation uses CC-BY-SA-4.0. See [LICENSES](LICENSES/) for the full license texts.
 
 Fortinet product names are used only to identify compatibility. This project
 is not affiliated with or endorsed by Fortinet.

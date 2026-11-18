@@ -107,37 +107,16 @@ fn directory(state_root: &Path, settings: &Settings) -> ProfileResult<PathBuf> {
     Ok(directory)
 }
 
-async fn proxy<'a>(
-    connection: &'a zbus::Connection,
-    path: &'a OwnedObjectPath,
-) -> ProfileResult<zbus::Proxy<'a>> {
-    if !path
-        .as_str()
-        .starts_with("/org/freedesktop/NetworkManager/Settings/")
-    {
-        return Err(ProfileError("The VPN profile path is invalid"));
-    }
-    zbus::Proxy::new(connection, NM_BUS_NAME, path, NM_CONNECTION_INTERFACE)
-        .await
-        .map_err(|_| ProfileError("NetworkManager is unavailable"))
-}
-
-pub async fn credentials(
-    connection: &zbus::Connection,
+pub fn credentials(
     state_root: &Path,
-    path: &OwnedObjectPath,
+    settings: &Settings,
 ) -> ProfileResult<(String, auth::Credentials, PathBuf)> {
-    let proxy = proxy(connection, path).await?;
-    let settings: Settings = proxy
-        .call("GetSettings", &())
-        .await
-        .map_err(|_| ProfileError("The VPN profile is unavailable"))?;
-    if !is_openconnect_fortinet(&settings) {
+    if !is_openconnect_fortinet(settings) {
         return Err(ProfileError("This VPN profile is not a Fortinet profile"));
     }
-    let directory = directory(state_root, &settings)?;
+    let directory = directory(state_root, settings)?;
     let credentials = auth::load(&directory.join("auth.json"))?;
-    let current = dictionary(&settings, "data")?;
+    let current = dictionary(settings, "data")?;
     for (key, expected) in data(&credentials) {
         if current.get(&key) != Some(&expected) {
             return Err(ProfileError(
@@ -157,7 +136,7 @@ pub async fn credentials(
         }
     }
     Ok((
-        value(&settings, "connection", "id")
+        value(settings, "connection", "id")
             .unwrap_or("Fortinet VPN")
             .into(),
         credentials,
