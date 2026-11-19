@@ -142,6 +142,7 @@ name = "ghaf-fortivpn-service"
 version = "0.1.0"
 dependencies = [
  "cc",
+ "futures-util",
  "openssl",
  "pkg-config",
  "serde",
