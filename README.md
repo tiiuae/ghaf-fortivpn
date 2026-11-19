@@ -66,8 +66,9 @@ The D-Bus contract currently uses:
   application.
 - Certificate inputs have strict size limits and are parsed by the backend
   with OpenSSL.
-- Before creating a profile, the backend removes orphaned application-managed
-  material and permits at most 32 OpenConnect Fortinet profiles.
+- Deleting a VPN profile also removes its saved password and imported keys from
+  `net-vm`. The backend checks for missed deletions at startup, when NetworkManager
+  returns, and before creating a profile. Up to 32 OpenConnect Fortinet profiles are allowed.
 - The backend checks certificate validity and verifies that a client
   certificate matches its private key.
 - Imported private keys are normalized to unencrypted PKCS#8 and stored as

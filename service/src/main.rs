@@ -7,6 +7,7 @@ mod profiles;
 #[cfg(test)]
 mod profile_tests;
 
+use futures_util::StreamExt;
 use openssl::asn1::Asn1Time;
 use openssl::pkcs12::Pkcs12;
 use openssl::pkey::{PKey, Private};
@@ -77,14 +78,9 @@ struct ProfileParameters<'a> {
     trusted_certificate: &'a str,
 }
 
-struct NetworkManagerProfiles {
-    uuids: HashSet<String>,
-    fortivpn_count: usize,
-}
-
 struct FortiVpnService {
     state_root: PathBuf,
-    profile_creation: Mutex<()>,
+    profile_creation: Arc<Mutex<()>>,
     authentication: Arc<auth::Authentication>,
 }
 
@@ -423,39 +419,43 @@ fn reconcile_profile_storage(
     Ok(())
 }
 
-async fn network_manager_profiles(
-    connection: &zbus::Connection,
-) -> ProfileResult<NetworkManagerProfiles> {
-    let settings_proxy = zbus::Proxy::new(
+async fn nm_settings(connection: &zbus::Connection) -> zbus::Result<zbus::Proxy<'_>> {
+    zbus::Proxy::new(
         connection,
         NM_BUS_NAME,
         NM_SETTINGS_PATH,
         NM_SETTINGS_INTERFACE,
     )
     .await
-    .map_err(|_| ProfileError("NetworkManager is unavailable"))?;
-    let profile_paths: Vec<OwnedObjectPath> = settings_proxy
-        .call("ListConnections", &())
-        .await
-        .map_err(|_| ProfileError("NetworkManager is unavailable"))?;
+}
 
-    let mut profiles = NetworkManagerProfiles {
-        uuids: HashSet::new(),
-        fortivpn_count: 0,
-    };
+async fn reconcile_profiles(settings: &zbus::Proxy<'_>, state_root: &Path) -> ProfileResult<usize> {
+    let unavailable = || ProfileError("NetworkManager is unavailable");
+    let reply = settings
+        .call_method("ListConnections", &())
+        .await
+        .map_err(|_| unavailable())?;
+    let profile_paths: Vec<OwnedObjectPath> =
+        reply.body().deserialize().map_err(|_| unavailable())?;
+    let header = reply.header();
+    // Read all profiles from the same NetworkManager instance, including during restarts.
+    let owner = header.sender().ok_or_else(unavailable)?;
+
+    let mut uuids = HashSet::new();
+    let mut fortivpn_count = 0;
     for profile_path in profile_paths {
         let profile_proxy = zbus::Proxy::new(
-            connection,
-            NM_BUS_NAME,
+            settings.connection(),
+            owner.as_str(),
             profile_path,
             NM_CONNECTION_INTERFACE,
         )
         .await
-        .map_err(|_| ProfileError("NetworkManager is unavailable"))?;
+        .map_err(|_| unavailable())?;
         let settings: Settings = profile_proxy
             .call("GetSettings", &())
             .await
-            .map_err(|_| ProfileError("NetworkManager is unavailable"))?;
+            .map_err(|_| unavailable())?;
         let uuid = settings
             .get("connection")
             .and_then(|connection| connection.get("uuid"))
@@ -463,13 +463,14 @@ async fn network_manager_profiles(
             .ok_or(ProfileError(
                 "NetworkManager returned invalid connection settings",
             ))?;
-        profiles.uuids.insert(uuid.into());
+        uuids.insert(uuid.into());
 
         if profiles::is_openconnect_fortinet(&settings) {
-            profiles.fortivpn_count += 1;
+            fortivpn_count += 1;
         }
     }
-    Ok(profiles)
+    reconcile_profile_storage(state_root, &uuids)?;
+    Ok(fortivpn_count)
 }
 
 fn store_materials(
@@ -692,9 +693,10 @@ async fn create_profile(
     let connection = zbus::Connection::system()
         .await
         .map_err(|_| ProfileError("NetworkManager is unavailable"))?;
-    let network_manager_profiles = network_manager_profiles(&connection).await?;
-    reconcile_profile_storage(state_root, &network_manager_profiles.uuids)?;
-    if network_manager_profiles.fortivpn_count >= MAX_PROFILE_COUNT {
+    let settings_proxy = nm_settings(&connection)
+        .await
+        .map_err(|_| ProfileError("NetworkManager is unavailable"))?;
+    if reconcile_profiles(&settings_proxy, state_root).await? >= MAX_PROFILE_COUNT {
         return Err(ProfileError(PROFILE_LIMIT_ERROR));
     }
 
@@ -715,14 +717,6 @@ async fn create_profile(
             &state_root.join(&profile_uuid).join("auth.json"),
             &credentials,
         )?;
-        let settings_proxy = zbus::Proxy::new(
-            &connection,
-            NM_BUS_NAME,
-            NM_SETTINGS_PATH,
-            NM_SETTINGS_INTERFACE,
-        )
-        .await
-        .map_err(|_| ProfileError("NetworkManager is unavailable"))?;
         let _: OwnedObjectPath = settings_proxy
             .call("AddConnection", &(settings))
             .await
@@ -800,25 +794,47 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_ROOT));
     let authentication = Arc::new(auth::Authentication::default());
+    let profile_creation = Arc::new(Mutex::new(()));
     let service = FortiVpnService {
         state_root: state_root.clone(),
-        profile_creation: Mutex::new(()),
+        profile_creation: profile_creation.clone(),
         authentication: authentication.clone(),
     };
-    let _connection = zbus::connection::Builder::system()
+    let connection = zbus::connection::Builder::system()
         .name(BUS_NAME)
         .name("org.ghaf.FortiVpn.Authentication")
         .serve_at(OBJECT_PATH, service)
         .serve_at(
             "/org/ghaf/FortiVpnAuthentication",
             Plugin {
-                state_root,
+                state_root: state_root.clone(),
                 authentication,
             },
         )
         .build()
         .await?;
-    std::future::pending().await
+    let settings = nm_settings(&connection).await?;
+    let mut removed = settings.receive_signal("ConnectionRemoved").await?;
+    let mut started = settings
+        .receive_owner_changed()
+        .await?
+        .filter(|owner| std::future::ready(owner.is_some()));
+    // Subscribe before reconciling so a deletion during startup is also observed.
+    loop {
+        let result = {
+            let _guard = profile_creation.lock().await;
+            reconcile_profiles(&settings, &state_root).await
+        };
+        if let Err(error) = &result {
+            eprintln!("FortiVPN profile cleanup deferred: {}", error.0);
+        }
+        tokio::select! {
+            event = removed.next() => if event.is_none() { break },
+            event = started.next() => if event.is_none() { break },
+            _ = tokio::time::sleep(std::time::Duration::from_secs(30)), if result.is_err() => {}
+        }
+    }
+    Err("NetworkManager signal stream closed".into())
 }
 
 #[cfg(test)]
